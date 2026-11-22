@@ -4,131 +4,187 @@ if (!defined('ABSPATH')) {
 }
 
 /**
- * Add custom rewrite rules.
- * NOTE: flush_rewrite_rules() is NOT called here.
+ * Sanitized path of the current request, relative to the site root.
+ *
+ * "/blog/news-sitemap.xml?x=1" on a site installed in /blog becomes
+ * "/news-sitemap.xml". The query string is dropped: only the path decides
+ * whether the sitemap is requested. The previous check searched the raw
+ * REQUEST_URI for "/news-sitemap.xml", so it also matched any URL that
+ * merely carried that string inside its query string.
+ *
+ * @return string Path with a leading slash; "/" for the front page.
  */
-function xsmg_add_rewrite_rules() {
-    add_rewrite_rule(
-        '^news-sitemap([0-9]*)\.xml$',
-        'index.php?xsmg_news_sitemap=$matches[1]',
-        'top'
-    );
-}
-add_action('init', 'xsmg_add_rewrite_rules', 1);
-
-/**
- * Template redirect to serve sitemap.
- */
-function xsmg_template_redirect() {
-    // Use sanitize_text_field for REQUEST_URI (path + query).
+function xsmg_get_request_path() {
     $request_uri = isset($_SERVER['REQUEST_URI'])
-        ? sanitize_text_field(wp_unslash($_SERVER['REQUEST_URI']))
+        ? esc_url_raw(wp_unslash($_SERVER['REQUEST_URI']))
         : '';
 
-    $permalink_structure = get_option('permalink_structure');
-    $is_pretty_enabled   = !empty($permalink_structure);
+    $path = (string) wp_parse_url($request_uri, PHP_URL_PATH);
+    if ($path === '') {
+        return '/';
+    }
 
-    $current_sitemap_url = $is_pretty_enabled
-        ? home_url('/news-sitemap.xml')
-        : home_url('/?xsmg_news_sitemap=1');
+    // Strip the subdirectory prefix of a site installed below the domain.
+    $home_path = (string) wp_parse_url(home_url('/'), PHP_URL_PATH);
+    $home_path = '/' . trim($home_path, '/');
+    if ($home_path !== '/' && ($path === $home_path || strpos($path, $home_path . '/') === 0)) {
+        $path = substr($path, strlen($home_path));
+    }
 
-    $sitemap = get_query_var('xsmg_news_sitemap');
+    return '/' . ltrim($path, '/');
+}
 
-    // Redirect old sitemap URL to the correct one.
-    if (
-        ($sitemap !== '' && $is_pretty_enabled && strpos($request_uri, '/news-sitemap.xml') === false) ||
-        (!$is_pretty_enabled && strpos($request_uri, '/news-sitemap.xml') !== false)
-    ) {
-        wp_redirect($current_sitemap_url, 301);
-        exit;
+/**
+ * Serve the news sitemap.
+ *
+ * There is exactly one sitemap document at one URL. The sanitized request
+ * path is compared with the canonical path for equality: no query
+ * parameter, query var or rewrite capture selects what is served, so a
+ * visitor cannot influence the sitemap content. Any other path is an
+ * ordinary WordPress request and is left untouched.
+ */
+function xsmg_template_redirect() {
+    if (xsmg_get_request_path() !== XSMG_SITEMAP_PATH) {
+        return;
     }
 
     if (!is_main_query()) {
         return;
     }
 
-    // Normalize: /news-sitemap.xml → index 1.
-    if ($sitemap === '' && strpos($request_uri, '/news-sitemap.xml') !== false) {
-        $sitemap = 1;
-    } elseif ($sitemap === '') {
-        return;
-    }
-
-    // Tell WordPress this is NOT a 404 - CRITICAL FOR GSC.
+    // The main query matched no post for this path and set 404: the sitemap
+    // is a real document and has to answer 200.
     global $wp_query;
-    $wp_query->is_404 = false;
+    if (is_object($wp_query)) {
+        $wp_query->is_404 = false;
+    }
     status_header(200);
 
-    xsmg_generate_news_sitemap($sitemap);
+    xsmg_generate_news_sitemap();
     exit;
 }
 add_action('template_redirect', 'xsmg_template_redirect', 0);
 
 /**
- * Generate sitemap XML.
+ * Remove characters that are not allowed in XML 1.0 text nodes.
  *
- * @param string|int $sitemap_index Sitemap page index.
+ * A title can reach the database through the REST API with a control
+ * character; one such byte makes the whole sitemap unparsable. Tab, line
+ * feed and carriage return are legal and kept, the rest of the C categories
+ * (including invalid UTF-8, replaced first) is dropped. Emoji are category
+ * So and pass through untouched.
+ *
+ * @param string $text Raw text.
+ * @return string Text that is safe inside an XML text node.
  */
-function xsmg_generate_news_sitemap($sitemap_index = '') {
-    $cache_key     = 'xsmg_sitemap_cache_' . $sitemap_index;
-    $cached_output = get_transient($cache_key);
+function xsmg_clean_xml_text($text) {
+    $text = (string) $text;
 
-    if ($cached_output !== false) {
-        if (is_array($cached_output) && isset($cached_output['xml'], $cached_output['generated_time'])) {
-            $sitemap_output = $cached_output['xml'];
-            $generated_time = $cached_output['generated_time'];
-        } else {
-            $sitemap_output = $cached_output;
-            $generated_time = time();
-        }
+    if (function_exists('wp_check_invalid_utf8')) {
+        $text = wp_check_invalid_utf8($text);
+    }
 
-        header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $generated_time) . ' GMT');
-        header('Cache-Control: public, max-age=' . (30 * 60));
-        if (!headers_sent()) {
-            header('Content-Type: application/xml; charset=utf-8');
-        }
-        echo $sitemap_output;
+    $clean = preg_replace('/[^\P{C}\t\n\r]/u', '', $text);
+
+    return $clean === null ? '' : $clean;
+}
+
+/**
+ * Response header values of a sitemap document.
+ *
+ * Built in one place so they can be asserted without a web server; the
+ * cache lifetime matches the transient lifetime.
+ *
+ * @param int $generated_time Unix time the sitemap was generated.
+ * @return array{content_type:string,last_modified:string,cache_control:string}
+ */
+function xsmg_sitemap_headers($generated_time) {
+    return [
+        'content_type'  => 'application/xml; charset=utf-8',
+        'last_modified' => gmdate('D, d M Y H:i:s', (int) $generated_time) . ' GMT',
+        'cache_control' => 'public, max-age=' . (int) XSMG_CACHE_TTL,
+    ];
+}
+
+/**
+ * Send the response headers of a sitemap document.
+ *
+ * A Content-Type set by an earlier hook is removed first, so the response
+ * never carries two of them.
+ *
+ * @param int $generated_time Unix time the sitemap was generated.
+ */
+function xsmg_send_sitemap_headers($generated_time) {
+    if (headers_sent()) {
+        return;
+    }
+
+    $headers = xsmg_sitemap_headers($generated_time);
+
+    header_remove('Content-Type');
+    header_remove('Cache-Control');
+
+    header('Content-Type: ' . (string) $headers['content_type']);
+    header('Last-Modified: ' . (string) $headers['last_modified']);
+    header('Cache-Control: ' . (string) $headers['cache_control']);
+}
+
+/**
+ * Build and serve the news sitemap, from cache when possible.
+ *
+ * The document holds the newest XSMG_MAX_URLS posts published inside the
+ * XSMG_WINDOW_HOURS window. Google News sitemaps allow at most 1000 URLs
+ * per file, so there is one file and no pagination: a site publishing more
+ * than 1000 posts in 48 hours sees only the newest 1000.
+ */
+function xsmg_generate_news_sitemap() {
+    $cache_key = XSMG_CACHE_KEY;
+    $cached    = get_transient($cache_key);
+
+    $cached_xml     = '';
+    $generated_time = 0;
+
+    if (is_array($cached) && isset($cached['xml'], $cached['generated_time'])) {
+        $cached_xml     = (string) $cached['xml'];
+        $generated_time = (int) $cached['generated_time'];
+    } elseif (is_string($cached) && $cached !== '') {
+        // Entries written by 1.4 and earlier hold the XML itself.
+        $cached_xml     = $cached;
+        $generated_time = time();
+    }
+
+    if ($cached_xml !== '') {
+        xsmg_send_sitemap_headers($generated_time);
+        echo $cached_xml; // phpcs:ignore -- escaped XML, cached as a whole.
         flush();
         exit;
     }
 
-    // Clean output buffers.
-    while (ob_get_level()) {
+    // The sitemap replaces the response WordPress prepared: a buffer started
+    // by the theme or a plugin must not prefix the XML with HTML. @ is
+    // intentional — a non-removable buffer is not an error worth a warning
+    // in the response.
+    while (ob_get_level() > 0) {
         @ob_end_clean();
     }
 
+    // Apache may still gzip (or double-gzip) the body after our headers.
     if (function_exists('apache_setenv')) {
         @apache_setenv('no-gzip', 1);
     }
     @ini_set('zlib.output_compression', 'Off');
 
-    // Remove only specific headers instead of ALL.
-    if (!headers_sent()) {
-        header_remove('Content-Type');
-        header_remove('Cache-Control');
-    }
-    header('Content-Type: application/xml; charset=utf-8');
-
     try {
-        $limit  = 1000; // Google News sitemap limit: 1000 URLs per file.
-        $offset = 0;
-
-        // Use absint for safe integer conversion.
-        $sitemap_index = absint($sitemap_index);
-        if ($sitemap_index > 1) {
-            $offset = ($sitemap_index - 1) * $limit;
-        }
-
         $args = [
             'post_type'      => ['post'],
             'post_status'    => 'publish',
-            'posts_per_page' => $limit,
-            'offset'         => $offset,
+            'posts_per_page' => XSMG_MAX_URLS,
             'orderby'        => 'date',
             'order'          => 'DESC',
             'date_query'     => [
-                ['after' => '48 hours ago'],
+                ['after' => XSMG_WINDOW_HOURS . ' hours ago'],
             ],
+            'has_password'   => false,
             'fields'         => 'ids',
         ];
 
@@ -144,8 +200,10 @@ function xsmg_generate_news_sitemap($sitemap_index = '') {
 
         $posts = get_posts($args);
 
-        // Determine publication language per Google News spec.
-        $lang = strtolower(get_bloginfo('language'));
+        // Publication language per Google News spec: the two Chinese
+        // locales keep their region, every other locale is reduced to its
+        // primary subtag.
+        $lang = strtolower((string) get_bloginfo('language'));
         if (strpos($lang, 'zh-cn') === 0) {
             $lang = 'zh-cn';
         } elseif (strpos($lang, 'zh-tw') === 0) {
@@ -154,55 +212,73 @@ function xsmg_generate_news_sitemap($sitemap_index = '') {
             $lang = explode('-', $lang)[0];
         }
 
-        $site_name = get_bloginfo('name');
+        $site_name = (string) get_bloginfo('name');
 
-        ob_start();
-        echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
-        ?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
-        xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">
-<?php
+        // esc_html() escapes &, <, > and the quotes, so a title can never
+        // terminate the document or open a CDATA section (no CDATA is used).
+        // esc_url() is the documented way to emit <loc> and keeps "&" as a
+        // valid XML character reference.
+        $xml  = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+        $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"';
+        $xml .= ' xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">' . "\n";
+
         foreach ($posts as $post_id) {
+            $link = get_permalink($post_id);
+            if (!$link) {
+                continue;
+            }
+
             $title    = wp_strip_all_tags(get_the_title($post_id));
             $pub_date = get_the_date('c', $post_id);
-            $link     = get_permalink($post_id);
-            ?>
-    <url>
-        <loc><?php echo esc_url($link); ?></loc>
-        <news:news>
-            <news:publication>
-                <news:name><?php echo esc_html($site_name); ?></news:name>
-                <news:language><?php echo esc_html($lang); ?></news:language>
-            </news:publication>
-            <news:publication_date><?php echo esc_html($pub_date); ?></news:publication_date>
-            <news:title><?php echo esc_html($title); ?></news:title>
-        </news:news>
-    </url>
-<?php } ?>
-</urlset>
-<?php
-        $sitemap_output = ob_get_clean();
+
+            $xml .= "\t<url>\n";
+            $xml .= "\t\t<loc>" . esc_url($link) . "</loc>\n";
+            $xml .= "\t\t<news:news>\n";
+            $xml .= "\t\t\t<news:publication>\n";
+            $xml .= "\t\t\t\t<news:name>" . esc_html(xsmg_clean_xml_text($site_name)) . "</news:name>\n";
+            $xml .= "\t\t\t\t<news:language>" . esc_html($lang) . "</news:language>\n";
+            $xml .= "\t\t\t</news:publication>\n";
+            $xml .= "\t\t\t<news:publication_date>" . esc_html((string) $pub_date) . "</news:publication_date>\n";
+            $xml .= "\t\t\t<news:title>" . esc_html(xsmg_clean_xml_text($title)) . "</news:title>\n";
+            $xml .= "\t\t</news:news>\n";
+            $xml .= "\t</url>\n";
+        }
+
+        $xml .= "</urlset>\n";
+
         $generated_time = time();
 
-        $cache_data = [
-            'xml'            => $sitemap_output,
-            'generated_time' => $generated_time,
-            'human_time'     => current_time('mysql'),
-        ];
+        set_transient(
+            $cache_key,
+            [
+                'xml'            => $xml,
+                'generated_time' => $generated_time,
+                'human_time'     => current_time('mysql'),
+            ],
+            XSMG_CACHE_TTL
+        );
 
-        set_transient($cache_key, $cache_data, 30 * MINUTE_IN_SECONDS);
+        xsmg_send_sitemap_headers($generated_time);
 
-        header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $generated_time) . ' GMT');
-        header('Cache-Control: public, max-age=' . (30 * 60));
-
-        echo $sitemap_output;
+        echo $xml; // phpcs:ignore -- escaped element by element above.
         flush();
         exit;
 
     } catch (\Throwable $e) {
+        // Details go to the site log only: the response must not leak paths.
         error_log('[XSMG] Sitemap generation error: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+
         status_header(500);
-        header('Content-Type: text/plain; charset=utf-8');
+        nocache_headers();
+
+        if (!headers_sent()) {
+            header('Content-Type: text/plain; charset=utf-8');
+        }
+
         echo 'Sitemap generation error. Please try again later.';
         exit;
     }
@@ -210,44 +286,67 @@ function xsmg_generate_news_sitemap($sitemap_index = '') {
 
 /**
  * Clear all sitemap cache transients.
- * Deletes both _transient_ and _transient_timeout_ records.
+ *
+ * The sweep is by name prefix, not by the current key: versions up to 1.4
+ * wrote a key per requested page (and could write a key from a raw request
+ * value), so a site may still hold transients whose names are not the
+ * single cache key of this version.
  */
 function xsmg_clear_all_cache() {
     global $wpdb;
 
-    // Get all cache keys (without timeout prefix).
     $keys = $wpdb->get_col(
-        "SELECT option_name FROM $wpdb->options
-         WHERE option_name LIKE '_transient_xsmg_sitemap_cache_%'
-         AND option_name NOT LIKE '_transient_timeout_%'"
+        $wpdb->prepare(
+            "SELECT option_name FROM {$wpdb->options}
+             WHERE option_name LIKE %s
+             AND option_name NOT LIKE %s",
+            xsmg_cache_like('_transient_'),
+            xsmg_cache_like('_transient_timeout_')
+        )
     );
 
-    foreach ($keys as $key) {
-        $transient_name = str_replace('_transient_', '', $key);
+    foreach ((array) $keys as $key) {
+        $transient_name = substr((string) $key, strlen('_transient_'));
         delete_transient($transient_name);
     }
 
-    // Clean up any orphaned timeout entries.
+    // Timeout rows of keys that no longer exist.
     $wpdb->query(
-        "DELETE FROM $wpdb->options
-         WHERE option_name LIKE '_transient_timeout_xsmg_sitemap_cache_%'"
+        $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+            xsmg_cache_like('_transient_timeout_')
+        )
     );
 
     update_option('xsmg_last_cache_clear', current_time('mysql'));
 }
 
 /**
+ * LIKE pattern matching every transient of this plugin.
+ *
+ * esc_like() is required: "_" and "%" are LIKE wildcards, and a pattern
+ * built by hand could match another plugin's transient names.
+ *
+ * @param string $name_prefix '_transient_' or '_transient_timeout_'.
+ * @return string Pattern with a trailing "%", ready for prepare().
+ */
+function xsmg_cache_like($name_prefix) {
+    global $wpdb;
+
+    return $wpdb->esc_like($name_prefix . XSMG_CACHE_KEY) . '%';
+}
+
+/**
  * Clear sitemap cache if affected post is changed.
- * Includes capability check to prevent unauthorized cache clearing.
+ *
+ * There is deliberately no current_user_can() check: save_post also fires
+ * for a scheduled post published by WP-Cron or a post imported by WP-CLI,
+ * where no user is logged in, and the sitemap still changed. The capability
+ * is enforced by the code that saves the post, not by cache invalidation.
  *
  * @param int $post_id Post ID.
  */
 function maybe_clear_sitemap_cache($post_id) {
-    // Only proceed if user has permission to edit posts.
-    if (!current_user_can('edit_posts')) {
-        return;
-    }
-
     if (wp_is_post_revision($post_id) || wp_is_post_autosave($post_id)) {
         return;
     }
@@ -257,7 +356,12 @@ function maybe_clear_sitemap_cache($post_id) {
         return;
     }
 
-    if (strtotime($post->post_date) < strtotime('-48 hours')) {
+    // Posts older than the 48-hour window are not in the sitemap. The
+    // timestamp is taken in GMT, like the window in the query, so the site
+    // timezone cannot shift the boundary. An empty date (a draft) is not
+    // older and clears the cache.
+    $post_time = (int) get_post_time('U', true, $post);
+    if ($post_time > 0 && $post_time < time() - (XSMG_WINDOW_HOURS * HOUR_IN_SECONDS)) {
         return;
     }
 
@@ -285,10 +389,14 @@ function xsmg_get_cache_info() {
     ];
 
     $keys = $wpdb->get_results(
-        "SELECT option_name, option_value
-         FROM $wpdb->options
-         WHERE option_name LIKE '_transient_xsmg_sitemap_cache_%'
-         AND option_name NOT LIKE '_transient_timeout_%'"
+        $wpdb->prepare(
+            "SELECT option_name, option_value
+             FROM {$wpdb->options}
+             WHERE option_name LIKE %s
+             AND option_name NOT LIKE %s",
+            xsmg_cache_like('_transient_'),
+            xsmg_cache_like('_transient_timeout_')
+        )
     );
 
     if ($keys) {
@@ -324,6 +432,9 @@ function xsmg_get_cache_info() {
 /**
  * Clear old cache (older than specified hours).
  *
+ * Transients expire after 30 minutes on their own; this is the daily safety
+ * net for entries whose timeout row is gone.
+ *
  * @param int $hours Hours threshold.
  * @return int Number of cleared transients.
  */
@@ -331,21 +442,25 @@ function xsmg_clear_old_cache($hours = 48) {
     global $wpdb;
 
     $keys = $wpdb->get_col(
-        "SELECT option_name
-         FROM $wpdb->options
-         WHERE option_name LIKE '_transient_xsmg_sitemap_cache_%'
-         AND option_name NOT LIKE '_transient_timeout_%'"
+        $wpdb->prepare(
+            "SELECT option_name
+             FROM {$wpdb->options}
+             WHERE option_name LIKE %s
+             AND option_name NOT LIKE %s",
+            xsmg_cache_like('_transient_'),
+            xsmg_cache_like('_transient_timeout_')
+        )
     );
 
     $cleared     = 0;
-    $cutoff_time = time() - ($hours * 3600);
+    $cutoff_time = time() - (absint($hours) * HOUR_IN_SECONDS);
 
-    foreach ($keys as $key) {
-        $transient_name = str_replace('_transient_', '', $key);
+    foreach ((array) $keys as $key) {
+        $transient_name = substr((string) $key, strlen('_transient_'));
         $cache_data     = get_transient($transient_name);
 
         if (is_array($cache_data) && isset($cache_data['generated_time'])) {
-            if ($cache_data['generated_time'] < $cutoff_time) {
+            if ((int) $cache_data['generated_time'] < $cutoff_time) {
                 delete_transient($transient_name);
                 $cleared++;
             }
