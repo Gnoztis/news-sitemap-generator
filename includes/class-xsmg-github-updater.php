@@ -415,10 +415,19 @@ final class XSMG_GitHub_Updater {
     /**
      * Drops every cached value of this class so the next check reads GitHub
      * again instead of serving data read before the files were replaced.
+     *
+     * Also used by uninstall: the two transients must not outlive the plugin.
      */
-    private function flush(): void {
+    public static function clear_cache(): void {
         delete_transient(self::TRANSIENT);
         delete_transient(self::ERROR_TRANSIENT);
+    }
+
+    /**
+     * Drops the cached check and the core update transient.
+     */
+    private function flush(): void {
+        self::clear_cache();
         delete_site_transient('update_plugins');
 
         self::$header = null;

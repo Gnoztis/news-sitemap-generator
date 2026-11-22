@@ -2,7 +2,7 @@
 /**
  * Plugin Name: XML Sitemap Generator (xsmg)
  * Description: Serves a Google News sitemap with the newest posts published within the last 48 hours (up to 1000 URLs), cached for 30 minutes.
- * Version: 1.5.0
+ * Version: 1.5.1
  * Requires at least: 6.0
  * Tested up to: 7.1
  * Requires PHP: 8.4
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('XSMG_VERSION', '1.5.0');
+define('XSMG_VERSION', '1.5.1');
 define('XSMG_PLUGIN_FILE', __FILE__);
 define('XSMG_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('XSMG_PLUGIN_URL', plugin_dir_url(__FILE__));
@@ -31,6 +31,10 @@ define('XSMG_MAX_URLS', 1000);
 define('XSMG_SITEMAP_PATH', '/news-sitemap.xml');
 define('XSMG_CACHE_KEY', 'xsmg_sitemap_cache');
 define('XSMG_CACHE_TTL', 30 * MINUTE_IN_SECONDS);
+
+// Diagnostic flag for the admin notice: "1" when the Yoast schema filter hides
+// every post in the window, "0" when it does not. Never a user setting.
+define('XSMG_YOAST_EMPTY_KEY', 'xsmg_yoast_empty');
 
 require_once XSMG_PLUGIN_DIR . 'includes/sitemap-generator.php';
 require_once XSMG_PLUGIN_DIR . 'includes/class-xsmg-github-updater.php';
@@ -139,6 +143,11 @@ function xsmg_uninstall_plugin() {
     // during uninstall and stay behind.
     if (function_exists('xsmg_clear_all_cache')) {
         xsmg_clear_all_cache();
+    }
+
+    // The updater keeps its own transients outside the sitemap cache.
+    if (class_exists('XSMG_GitHub_Updater')) {
+        XSMG_GitHub_Updater::clear_cache();
     }
 
     delete_option('xsmg_last_permalink_structure');

@@ -130,6 +130,132 @@ function xsmg_send_sitemap_headers($generated_time) {
 }
 
 /**
+ * Query args of the 48-hour window, without the sitemap-specific parts.
+ *
+ * Shared by the sitemap query and by the diagnostics, so the window cannot
+ * drift between them.
+ *
+ * @return array
+ */
+function xsmg_window_query_args() {
+    return [
+        'post_type'    => ['post'],
+        'post_status'  => 'publish',
+        'orderby'      => 'date',
+        'order'        => 'DESC',
+        'date_query'   => [
+            ['after' => XSMG_WINDOW_HOURS . ' hours ago'],
+        ],
+        'has_password' => false,
+    ];
+}
+
+/**
+ * Query args of the sitemap document.
+ *
+ * One query returns full post objects and primes the post and meta caches,
+ * so the rendering loop never loads a post by ID one at a time. With only IDs
+ * (`'fields' => 'ids'`) a cold generation ran up to 1000 extra get_post()
+ * queries; now it is one query plus the meta cache priming.
+ *
+ * The Yoast condition and the NewsArticle value are kept exactly as in 1.4:
+ * existing sites rely on them.
+ *
+ * @return array
+ */
+function xsmg_sitemap_query_args() {
+    $args = xsmg_window_query_args();
+
+    $args['posts_per_page']         = XSMG_MAX_URLS;
+    $args['update_post_meta_cache'] = true;
+    $args['update_post_term_cache'] = false;
+
+    // Only filter by Yoast schema type if Yoast is active.
+    if (defined('WPSEO_VERSION')) {
+        $args['meta_query'] = [
+            [
+                'key'   => '_yoast_wpseo_schema_article_type',
+                'value' => 'NewsArticle',
+            ],
+        ];
+    }
+
+    return $args;
+}
+
+/**
+ * Whether the 48-hour window contains at least one published post.
+ *
+ * @return bool
+ */
+function xsmg_window_has_posts() {
+    $args = xsmg_window_query_args();
+
+    $args['posts_per_page']         = 1;
+    $args['fields']                 = 'ids';
+    $args['update_post_meta_cache'] = false;
+    $args['update_post_term_cache'] = false;
+
+    return (bool) get_posts($args);
+}
+
+/**
+ * Whether Yoast is hiding every post that the window contains.
+ *
+ * True only when Yoast is active, the window has at least one published post
+ * and none of those posts carries the NewsArticle schema article type — the
+ * case where the sitemap is empty although the site published. The answer is
+ * cached with the sitemap, so an admin page load does not repeat the queries,
+ * and generation updates it as a side effect.
+ *
+ * @return bool
+ */
+function xsmg_yoast_filter_hides_posts() {
+    if (!defined('WPSEO_VERSION')) {
+        return false;
+    }
+
+    $cached = get_transient(XSMG_YOAST_EMPTY_KEY);
+    if ($cached === '1' || $cached === '0') {
+        return $cached === '1';
+    }
+
+    $hides = false;
+
+    if (xsmg_window_has_posts()) {
+        $args = xsmg_sitemap_query_args();
+
+        $args['posts_per_page']         = 1;
+        $args['fields']                 = 'ids';
+        $args['update_post_meta_cache'] = false;
+        $args['update_post_term_cache'] = false;
+
+        $hides = empty(get_posts($args));
+    }
+
+    set_transient(XSMG_YOAST_EMPTY_KEY, $hides ? '1' : '0', XSMG_CACHE_TTL);
+
+    return $hides;
+}
+
+/**
+ * Warn editors when the Yoast schema filter leaves the sitemap empty.
+ *
+ * No setting is introduced: the filter itself is 1.4-compatible behaviour and
+ * is not changed, the notice only makes the result visible.
+ */
+function xsmg_yoast_empty_notice() {
+    if (!current_user_can('edit_posts') || !xsmg_yoast_filter_hides_posts()) {
+        return;
+    }
+
+    echo '<div class="notice notice-warning is-dismissible"><p>'
+        . esc_html__('XML Sitemap Generator: в окне 48 часов нет записей с типом схемы NewsArticle — проверьте тип схемы у свежих записей.', 'news-sitemap-generator')
+        . '</p></div>';
+}
+add_action('admin_notices', 'xsmg_yoast_empty_notice');
+
+/**
  * Build and serve the news sitemap, from cache when possible.
  *
  * The document holds the newest XSMG_MAX_URLS posts published inside the
@@ -175,30 +301,27 @@ function xsmg_generate_news_sitemap() {
     @ini_set('zlib.output_compression', 'Off');
 
     try {
-        $args = [
-            'post_type'      => ['post'],
-            'post_status'    => 'publish',
-            'posts_per_page' => XSMG_MAX_URLS,
-            'orderby'        => 'date',
-            'order'          => 'DESC',
-            'date_query'     => [
-                ['after' => XSMG_WINDOW_HOURS . ' hours ago'],
-            ],
-            'has_password'   => false,
-            'fields'         => 'ids',
-        ];
+        // One query returns full post objects with their caches primed; see
+        // xsmg_sitemap_query_args().
+        $posts = get_posts(xsmg_sitemap_query_args());
 
-        // Only filter by Yoast schema type if Yoast is active.
+        // Yoast can filter every post out of the window. That is not the same
+        // as "no news", so it is logged once per generation (a cache hit
+        // returns before this point and logs nothing) and flagged for the
+        // admin notice. The filter itself is not changed.
         if (defined('WPSEO_VERSION')) {
-            $args['meta_query'] = [
-                [
-                    'key'   => '_yoast_wpseo_schema_article_type',
-                    'value' => 'NewsArticle',
-                ],
-            ];
-        }
+            $hides_everything = empty($posts) && xsmg_window_has_posts();
 
-        $posts = get_posts($args);
+            set_transient(XSMG_YOAST_EMPTY_KEY, $hides_everything ? '1' : '0', XSMG_CACHE_TTL);
+
+            if ($hides_everything) {
+                error_log(
+                    '[XSMG] Sitemap is empty: Yoast SEO is active and no post in the '
+                    . XSMG_WINDOW_HOURS . '-hour window carries the NewsArticle schema '
+                    . 'article type. Check the schema article type of recent posts.'
+                );
+            }
+        }
 
         // Publication language per Google News spec: the two Chinese
         // locales keep their region, every other locale is reduced to its
@@ -222,14 +345,14 @@ function xsmg_generate_news_sitemap() {
         $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"';
         $xml .= ' xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">' . "\n";
 
-        foreach ($posts as $post_id) {
-            $link = get_permalink($post_id);
+        foreach ($posts as $post) {
+            $link = get_permalink($post);
             if (!$link) {
                 continue;
             }
 
-            $title    = wp_strip_all_tags(get_the_title($post_id));
-            $pub_date = get_the_date('c', $post_id);
+            $title    = wp_strip_all_tags(get_the_title($post));
+            $pub_date = get_the_date('c', $post);
 
             $xml .= "\t<url>\n";
             $xml .= "\t\t<loc>" . esc_url($link) . "</loc>\n";
@@ -317,6 +440,10 @@ function xsmg_clear_all_cache() {
             xsmg_cache_like('_transient_timeout_')
         )
     );
+
+    // The Yoast diagnostic is refreshed with the sitemap, so a newly fixed
+    // schema type clears the admin notice on the next admin page load.
+    delete_transient(XSMG_YOAST_EMPTY_KEY);
 
     update_option('xsmg_last_cache_clear', current_time('mysql'));
 }
