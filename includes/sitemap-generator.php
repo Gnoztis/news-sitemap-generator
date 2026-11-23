@@ -388,8 +388,11 @@ function xsmg_generate_news_sitemap() {
         exit;
 
     } catch (\Throwable $e) {
-        // Details go to the site log only: the response must not leak paths.
-        error_log('[XSMG] Sitemap generation error: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+        // Details go to the site log only: the response must not leak paths,
+        // and the detail itself is written only with WP_DEBUG (SEC-001).
+        if ( defined( 'WP_DEBUG' ) && WP_DEBUG && function_exists( 'error_log' ) ) {
+            error_log('[XSMG] Sitemap generation error: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine()); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- WP_DEBUG only.
+        }
 
         while (ob_get_level() > 0) {
             @ob_end_clean();
