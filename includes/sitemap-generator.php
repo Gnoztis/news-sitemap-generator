@@ -153,10 +153,11 @@ function xsmg_window_query_args() {
 /**
  * Query args of the sitemap document.
  *
- * One query returns full post objects and primes the post and meta caches,
- * so the rendering loop never loads a post by ID one at a time. With only IDs
- * (`'fields' => 'ids'`) a cold generation ran up to 1000 extra get_post()
- * queries; now it is one query plus the meta cache priming.
+ * One query returns full post objects and primes the post, meta and term
+ * caches, so the rendering loop never loads a post, its meta or its tags one
+ * at a time. With only IDs (`'fields' => 'ids'`) a cold generation ran up to
+ * 1000 extra get_post() queries; now it is one query plus the cache priming,
+ * and the term cache is what makes news:keywords cheap.
  *
  * The Yoast condition and the NewsArticle value are kept exactly as in 1.4:
  * existing sites rely on them.
@@ -168,7 +169,9 @@ function xsmg_sitemap_query_args() {
 
     $args['posts_per_page']         = XSMG_MAX_URLS;
     $args['update_post_meta_cache'] = true;
-    $args['update_post_term_cache'] = false;
+    // Tags feed news:keywords; priming them in the same query avoids a term
+    // query per post.
+    $args['update_post_term_cache'] = true;
 
     // Only filter by Yoast schema type if Yoast is active.
     if (defined('WPSEO_VERSION')) {
@@ -256,6 +259,166 @@ function xsmg_yoast_empty_notice() {
 add_action('admin_notices', 'xsmg_yoast_empty_notice');
 
 /**
+ * W3C datetime of a post, with a fallback to its GMT timestamp.
+ *
+ * get_the_date('c') normally returns a valid ISO 8601 value, but a filter can
+ * replace it with anything, and an empty or malformed publication_date makes
+ * the whole document invalid. Google accepts the W3C profile with a timezone,
+ * so the value is checked against that pattern and rebuilt from post_date_gmt
+ * when it does not match.
+ *
+ * @param mixed $post Post object or ID.
+ * @return string Valid W3C datetime, or '' when neither source works.
+ */
+function xsmg_publication_date($post) {
+    $pattern = '/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2}))?$/';
+
+    $date = (string) get_the_date('c', $post);
+    if (preg_match($pattern, $date) === 1) {
+        return $date;
+    }
+
+    $gmt = is_object($post) && isset($post->post_date_gmt) ? (string) $post->post_date_gmt : '';
+    if ($gmt === '' || $gmt === '0000-00-00 00:00:00') {
+        return '';
+    }
+
+    $timestamp = strtotime($gmt . ' GMT');
+    if ($timestamp === false) {
+        return '';
+    }
+
+    $fallback = gmdate('c', $timestamp);
+
+    return preg_match($pattern, $fallback) === 1 ? $fallback : '';
+}
+
+/**
+ * Comma-separated keywords of a post from its tags.
+ *
+ * Google News recommends news:keywords and allows at most 10 comma-separated
+ * values. A tag name may itself contain a comma, which would split it into
+ * fake values, so commas are replaced with a space; empty names are dropped
+ * and duplicates are merged. The caller omits the element when this is ''.
+ *
+ * @param mixed $post Post object or ID.
+ * @return string
+ */
+function xsmg_post_keywords($post) {
+    $tags = get_the_tags($post);
+    if (!is_array($tags)) {
+        return '';
+    }
+
+    $keywords = [];
+
+    foreach ($tags as $tag) {
+        if (!is_object($tag) || !isset($tag->name)) {
+            continue;
+        }
+
+        $name = trim((string) preg_replace('/\s+/', ' ', str_replace(',', ' ', (string) $tag->name)));
+        if ($name === '') {
+            continue;
+        }
+
+        $keywords[$name] = $name;
+
+        if (count($keywords) >= 10) {
+            break;
+        }
+    }
+
+    return implode(', ', array_values($keywords));
+}
+
+/**
+ * Number of posts the 48-hour window holds under the sitemap filters.
+ *
+ * Called only when the file already reached XSMG_MAX_URLS, so the second
+ * query runs only in the case that needs a number for the admin diagnostic.
+ *
+ * @return int
+ */
+function xsmg_window_total_posts() {
+    $args = xsmg_sitemap_query_args();
+
+    $args['posts_per_page']         = -1;
+    $args['fields']                 = 'ids';
+    $args['update_post_meta_cache'] = false;
+    $args['update_post_term_cache'] = false;
+
+    return count((array) get_posts($args));
+}
+
+/**
+ * Add the news sitemap to robots.txt.
+ *
+ * The Sitemap: line is the standard way crawlers discover a file that is not
+ * listed in Search Console. It is added once: when the output already carries
+ * the same absolute URL the filter returns it unchanged, so repeated calls and
+ * other plugins' lines cannot duplicate it.
+ *
+ * @param string $output robots.txt content.
+ * @param bool   $public Whether the site is public (filter signature).
+ * @return string
+ */
+function xsmg_robots_txt($output, $public = null) {
+    $output  = (string) $output;
+    $sitemap = home_url(XSMG_SITEMAP_PATH);
+
+    foreach ((array) preg_split('/\r\n|\r|\n/', $output) as $line) {
+        if (preg_match('/^\s*Sitemap:\s*' . preg_quote($sitemap, '/') . '\s*$/i', (string) $line) === 1) {
+            return $output;
+        }
+    }
+
+    if ($output !== '' && substr($output, -1) !== "\n") {
+        $output .= "\n";
+    }
+
+    return $output . 'Sitemap: ' . $sitemap . "\n";
+}
+add_filter('robots_txt', 'xsmg_robots_txt', 10, 2);
+
+/**
+ * Tell editors when the window holds more posts than the sitemap can carry.
+ *
+ * The file keeps the newest XSMG_MAX_URLS posts (the Google News limit), so
+ * the truncation is real and must not be silent: the notice shows how many
+ * posts the 48-hour window holds and how many of them are in the file.
+ */
+function xsmg_overflow_notice() {
+    if (!current_user_can('edit_posts')) {
+        return;
+    }
+
+    $state = get_transient(XSMG_OVERFLOW_KEY);
+    if (!is_array($state) || empty($state['total']) || empty($state['shown'])) {
+        return;
+    }
+
+    $total = (int) $state['total'];
+    $shown = (int) $state['shown'];
+
+    if ($total <= $shown) {
+        return;
+    }
+
+    echo '<div class="notice notice-warning is-dismissible"><p>'
+        . esc_html(
+            sprintf(
+                /* translators: 1: posts in the 48-hour window, 2: URLs written to the sitemap. */
+                __('XML Sitemap Generator: за последние 48 часов %1$d записей, а в карту попало только %2$d — лимит Google News 1000 URL на файл, более старые записи окна не выводятся.', 'news-sitemap-generator'),
+                $total,
+                $shown
+            )
+        )
+        . '</p></div>';
+}
+add_action('admin_notices', 'xsmg_overflow_notice');
+
+/**
  * Build and serve the news sitemap, from cache when possible.
  *
  * The document holds the newest XSMG_MAX_URLS posts published inside the
@@ -323,6 +486,27 @@ function xsmg_generate_news_sitemap() {
             }
         }
 
+        // The window can hold more posts than one file may carry. The sitemap
+        // keeps the newest XSMG_MAX_URLS; the numbers are kept for the admin
+        // notice, so the truncation is visible instead of silent.
+        $shown = count($posts);
+
+        if ($shown >= XSMG_MAX_URLS) {
+            $total = xsmg_window_total_posts();
+
+            if ($total > $shown) {
+                set_transient(
+                    XSMG_OVERFLOW_KEY,
+                    ['total' => $total, 'shown' => $shown],
+                    XSMG_CACHE_TTL
+                );
+            } else {
+                delete_transient(XSMG_OVERFLOW_KEY);
+            }
+        } else {
+            delete_transient(XSMG_OVERFLOW_KEY);
+        }
+
         // Publication language per Google News spec: the two Chinese
         // locales keep their region, every other locale is reduced to its
         // primary subtag.
@@ -335,7 +519,17 @@ function xsmg_generate_news_sitemap() {
             $lang = explode('-', $lang)[0];
         }
 
-        $site_name = (string) get_bloginfo('name');
+        // An empty publication name makes the document invalid; the host is
+        // the closest stable identifier when the site has no name set.
+        $site_name = trim(xsmg_clean_xml_text((string) get_bloginfo('name')));
+
+        if ($site_name === '') {
+            $site_name = trim(xsmg_clean_xml_text((string) wp_parse_url(home_url('/'), PHP_URL_HOST)));
+        }
+
+        if ($site_name === '') {
+            $site_name = trim(xsmg_clean_xml_text((string) home_url('/')));
+        }
 
         // esc_html() escapes &, <, > and the quotes, so a title can never
         // terminate the document or open a CDATA section (no CDATA is used).
@@ -351,8 +545,21 @@ function xsmg_generate_news_sitemap() {
                 continue;
             }
 
-            $title    = wp_strip_all_tags(get_the_title($post));
-            $pub_date = get_the_date('c', $post);
+            // A post without a usable title is useless in a news sitemap, and
+            // an empty news:title makes the document invalid: skip it.
+            $title = trim(xsmg_clean_xml_text(wp_strip_all_tags(get_the_title($post))));
+            if ($title === '') {
+                continue;
+            }
+
+            // Empty or malformed dates also invalidate the document; the
+            // helper falls back to the GMT timestamp or returns ''.
+            $pub_date = xsmg_publication_date($post);
+            if ($pub_date === '') {
+                continue;
+            }
+
+            $keywords = xsmg_post_keywords($post);
 
             $xml .= "\t<url>\n";
             $xml .= "\t\t<loc>" . esc_url($link) . "</loc>\n";
@@ -361,8 +568,13 @@ function xsmg_generate_news_sitemap() {
             $xml .= "\t\t\t\t<news:name>" . esc_html(xsmg_clean_xml_text($site_name)) . "</news:name>\n";
             $xml .= "\t\t\t\t<news:language>" . esc_html($lang) . "</news:language>\n";
             $xml .= "\t\t\t</news:publication>\n";
-            $xml .= "\t\t\t<news:publication_date>" . esc_html((string) $pub_date) . "</news:publication_date>\n";
-            $xml .= "\t\t\t<news:title>" . esc_html(xsmg_clean_xml_text($title)) . "</news:title>\n";
+            $xml .= "\t\t\t<news:publication_date>" . esc_html($pub_date) . "</news:publication_date>\n";
+            $xml .= "\t\t\t<news:title>" . esc_html($title) . "</news:title>\n";
+
+            if ($keywords !== '') {
+                $xml .= "\t\t\t<news:keywords>" . esc_html(xsmg_clean_xml_text($keywords)) . "</news:keywords>\n";
+            }
+
             $xml .= "\t\t</news:news>\n";
             $xml .= "\t</url>\n";
         }
@@ -444,9 +656,11 @@ function xsmg_clear_all_cache() {
         )
     );
 
-    // The Yoast diagnostic is refreshed with the sitemap, so a newly fixed
-    // schema type clears the admin notice on the next admin page load.
+    // The Yoast and overflow diagnostics are refreshed with the sitemap, so a
+    // newly fixed schema type or a shrunken window clears the notices on the
+    // next admin page load.
     delete_transient(XSMG_YOAST_EMPTY_KEY);
+    delete_transient(XSMG_OVERFLOW_KEY);
 
     update_option('xsmg_last_cache_clear', current_time('mysql'));
 }
