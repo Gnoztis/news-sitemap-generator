@@ -625,7 +625,6 @@ final class XSMG_GitHub_Updater {
 			if ( null === $files ) {
 				if ( function_exists( 'opcache_reset' ) ) {
 					opcache_reset();
-					error_log( sprintf( '[%s] opcache: reset (over %d files)', news-sitemap-generator, self::OPCACHE_CAP ) );
 				}
 
 				return;
@@ -642,9 +641,8 @@ final class XSMG_GitHub_Updater {
 			return;
 		}
 
-		if ( $count > 0 ) {
-			error_log( sprintf( '[%s] opcache: %d file(s)', news-sitemap-generator, $count ) );
-		}
+		// Intentionally silent: a successful invalidation needs no log entry, and a
+		// failed one is swallowed above so the update response stays intact.
 	}
 
 	/**

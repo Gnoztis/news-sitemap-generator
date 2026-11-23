@@ -476,7 +476,7 @@ function xsmg_cache_like($name_prefix) {
  *
  * @param int $post_id Post ID.
  */
-function maybe_clear_sitemap_cache($post_id) {
+function xsmg_maybe_clear_sitemap_cache($post_id) {
     if (wp_is_post_revision($post_id) || wp_is_post_autosave($post_id)) {
         return;
     }
@@ -497,9 +497,9 @@ function maybe_clear_sitemap_cache($post_id) {
 
     xsmg_clear_all_cache();
 }
-add_action('save_post', 'maybe_clear_sitemap_cache');
-add_action('before_delete_post', 'maybe_clear_sitemap_cache');
-add_action('trashed_post', 'maybe_clear_sitemap_cache');
+add_action('save_post', 'xsmg_maybe_clear_sitemap_cache');
+add_action('before_delete_post', 'xsmg_maybe_clear_sitemap_cache');
+add_action('trashed_post', 'xsmg_maybe_clear_sitemap_cache');
 
 /**
  * Get sitemap cache information.
