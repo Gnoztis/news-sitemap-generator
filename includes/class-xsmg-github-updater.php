@@ -49,6 +49,44 @@ final class XSMG_GitHub_Updater {
 		add_action( 'load-plugins.php',                      [ $this, 'maybe_force_check' ] );
 		add_action( 'admin_notices',                         [ $this, 'admin_notices' ] );
 		add_filter( 'plugin_action_links_' . self::basename(), [ $this, 'action_links' ] );
+		add_filter( 'http_request_args', [ $this, 'authenticate_download' ], 10, 2 );
+	}
+
+	/**
+	 * Attaches the token to the package download of a private repository.
+	 *
+	 * WordPress downloads the archive itself, outside api_get(), so without this
+	 * filter a private repository answers 404 even when the token is valid.
+	 * Only GitHub download hosts are touched: api.github.com (release assets),
+	 * codeload.github.com (zipball) and the signed asset host. A generic
+	 * github.com URL is deliberately left alone, so the token can never be sent
+	 * to another plugin's download.
+	 *
+	 * @param array<string,mixed> $args Request arguments.
+	 * @param string              $url  Request URL.
+	 * @return array<string,mixed>
+	 */
+	public function authenticate_download( $args, $url ) {
+		$token = self::token();
+
+		if ( '' === $token || ! is_string( $url ) || ! is_array( $args ) ) {
+			return $args;
+		}
+
+		if ( 'https' !== strtolower( (string) wp_parse_url( $url, PHP_URL_SCHEME ) ) ) {
+			return $args;
+		}
+
+		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+
+		if ( ! in_array( $host, [ 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com' ], true ) ) {
+			return $args;
+		}
+
+		$args['headers'] = is_array( $args['headers'] ?? null ) ? $args['headers'] : [];
+		$args['headers']['Authorization'] = 'Bearer ' . $token;
+
+		return $args;
 	}
 
 	/**
