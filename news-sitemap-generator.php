@@ -2,7 +2,7 @@
 /**
  * Plugin Name: XML Sitemap Generator (xsmg)
  * Description: Serves a Google News sitemap with the newest posts published within the last 48 hours (up to 1000 URLs), cached for 30 minutes.
- * Version: 1.5.1
+ * Version: 1.5.2
  * Requires at least: 6.0
  * Tested up to: 7.1
  * Requires PHP: 8.4
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('XSMG_VERSION', '1.5.1');
+define('XSMG_VERSION', '1.5.2');
 define('XSMG_PLUGIN_FILE', __FILE__);
 define('XSMG_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('XSMG_PLUGIN_URL', plugin_dir_url(__FILE__));
@@ -145,10 +145,11 @@ function xsmg_uninstall_plugin() {
         xsmg_clear_all_cache();
     }
 
-    // The updater keeps its own transients outside the sitemap cache.
-    if (class_exists('XSMG_GitHub_Updater')) {
-        XSMG_GitHub_Updater::clear_cache();
-    }
+    // The generated updater keeps its two transients outside the sitemap
+    // cache; the names are its TRANSIENT / ERROR_TRANSIENT constants, kept
+    // from the previous updater so an in-place update keeps its cache.
+    delete_transient('xsmg_github_release');
+    delete_transient('xsmg_github_release_error');
 
     delete_option('xsmg_last_permalink_structure');
     delete_option('xsmg_last_cache_clear');
