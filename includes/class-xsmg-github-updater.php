@@ -24,6 +24,16 @@ final class XSMG_GitHub_Updater {
 	private const TRANSIENT       = 'xsmg_github_release';
 	private const ERROR_TRANSIENT = 'xsmg_github_release_error';
 
+	/**
+	 * PHP files invalidated one by one after an update.
+	 *
+	 * The site runs with opcache.validate_timestamps=0, so a worker keeps
+	 * executing the bytecode of the replaced files until it is restarted.
+	 * Above the cap a single opcache_reset() is cheaper than thousands of
+	 * calls; the standalone guard does the same for every other update.
+	 */
+	private const OPCACHE_CAP = 2000;
+
 	private static ?array $header = null;
 
 	/**
@@ -552,6 +562,8 @@ final class XSMG_GitHub_Updater {
 	 * advertising an update for the version just installed.
 	 */
 	public function after_upgrade( $upgrader = null, $hook_extra = [] ): void {
+		$ours_updated = false;
+
 		if ( is_array( $hook_extra ) ) {
 			$ours = self::basename();
 			$hit  = false;
@@ -567,9 +579,99 @@ final class XSMG_GitHub_Updater {
 			if ( ! $hit ) {
 				return;
 			}
+
+			$ours_updated = true;
 		}
 
 		$this->flush();
+
+		// Only our own update, and only per file: a full reset is the
+		// standalone guard's job (OC-001), so the two never double-reset in
+		// the normal path. Invalidate twice would be harmless anyway.
+		if ( $ours_updated ) {
+			$this->invalidate_opcache();
+		}
+	}
+
+	/**
+	 * Drops the bytecode of the files just replaced.
+	 *
+	 * A no-op when OPcache is absent or disabled: the site then reads the
+	 * files from disk on every request and nothing has to be invalidated.
+	 * The log line carries no paths, only the plugin slug and the count.
+	 */
+	private function invalidate_opcache(): void {
+		$invalidate = function_exists( 'opcache_invalidate' );
+
+		if ( ! $invalidate && ! function_exists( 'opcache_reset' ) ) {
+			return;
+		}
+
+		$folder = dirname( self::basename() );
+		$dir    = ( '.' === $folder || '' === $folder )
+			? untrailingslashit( defined( 'WP_PLUGIN_DIR' ) ? WP_PLUGIN_DIR : dirname( XSMG_PLUGIN_FILE ) )
+			: trailingslashit( defined( 'WP_PLUGIN_DIR' ) ? WP_PLUGIN_DIR : dirname( XSMG_PLUGIN_FILE ) ) . $folder;
+
+		if ( ! is_dir( $dir ) ) {
+			return;
+		}
+
+		$count = 0;
+
+		try {
+			$files = $this->plugin_php_files( $dir );
+
+			// Over the cap: one reset instead of thousands of calls.
+			if ( null === $files ) {
+				if ( function_exists( 'opcache_reset' ) ) {
+					opcache_reset();
+					error_log( sprintf( '[%s] opcache: reset (over %d files)', news-sitemap-generator, self::OPCACHE_CAP ) );
+				}
+
+				return;
+			}
+
+			foreach ( $files as $file ) {
+				if ( $invalidate ) {
+					opcache_invalidate( $file, true );
+				}
+				$count++;
+			}
+		} catch ( Throwable $e ) {
+			// A failed invalidation must never break the update response.
+			return;
+		}
+
+		if ( $count > 0 ) {
+			error_log( sprintf( '[%s] opcache: %d file(s)', news-sitemap-generator, $count ) );
+		}
+	}
+
+	/**
+	 * PHP files of this plugin's directory.
+	 *
+	 * @return string[]|null Null when the directory holds more than the cap.
+	 */
+	private function plugin_php_files( string $dir ): ?array {
+		$files    = [];
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ),
+			RecursiveIteratorIterator::LEAVES_ONLY
+		);
+
+		foreach ( $iterator as $file ) {
+			if ( ! $file->isFile() || 'php' !== strtolower( (string) $file->getExtension() ) ) {
+				continue;
+			}
+
+			$files[] = $file->getPathname();
+
+			if ( count( $files ) > self::OPCACHE_CAP ) {
+				return null;
+			}
+		}
+
+		return $files;
 	}
 
 	/**
