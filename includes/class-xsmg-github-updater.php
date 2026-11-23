@@ -78,8 +78,18 @@ final class XSMG_GitHub_Updater {
 		}
 
 		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+		$path = (string) wp_parse_url( $url, PHP_URL_PATH );
 
-		if ( ! in_array( $host, [ 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com' ], true ) ) {
+		if ( 'github.com' === $host ) {
+			// A release asset is downloaded from github.com/<owner>/<repo>/
+			// releases/download/...; authorise it only for our own repository, so
+			// the token cannot travel to another plugin's download.
+			$ours = '/' . strtolower( 'news-sitemap-generator' ) . '/';
+
+			if ( false === strpos( strtolower( $path ), '/releases/download/' ) || false === strpos( strtolower( $path ), $ours ) ) {
+				return $args;
+			}
+		} elseif ( ! in_array( $host, [ 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com' ], true ) ) {
 			return $args;
 		}
 
