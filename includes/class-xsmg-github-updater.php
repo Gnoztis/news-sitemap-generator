@@ -286,10 +286,28 @@ final class XSMG_GitHub_Updater {
 		if ( ! is_string( $source ) || ! is_string( $remote_source ) ) {
 			return $source;
 		}
-		if ( ! is_array( $hook_extra ) || empty( $hook_extra['plugin'] ) ) {
+		if ( ! is_array( $hook_extra ) ) {
 			return $source;
 		}
-		if ( self::basename() !== (string) $hook_extra['plugin'] ) {
+
+		// A single update carries `plugin`, a bulk update carries `plugins`.
+		// Checking only the first form left bulk installs with the folder name
+		// taken from the archive, which produces a second copy of the plugin.
+		$ours   = self::basename();
+		$target = '';
+
+		if ( ! empty( $hook_extra['plugin'] ) ) {
+			$target = (string) $hook_extra['plugin'];
+		} elseif ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
+			foreach ( $hook_extra['plugins'] as $candidate ) {
+				if ( $ours === (string) $candidate ) {
+					$target = $ours;
+					break;
+				}
+			}
+		}
+
+		if ( '' === $target || $ours !== $target ) {
 			return $source;
 		}
 		if ( ! is_dir( $source ) ) {
@@ -336,11 +354,23 @@ final class XSMG_GitHub_Updater {
 	 * advertising an update for the version just installed.
 	 */
 	public function after_upgrade( $upgrader = null, $hook_extra = [] ): void {
-		if ( is_array( $hook_extra ) && ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
-			if ( ! in_array( self::basename(), $hook_extra['plugins'], true ) ) {
+		if ( is_array( $hook_extra ) ) {
+			$ours = self::basename();
+			$hit  = false;
+
+			if ( ! empty( $hook_extra['plugin'] ) ) {
+				$hit = $ours === (string) $hook_extra['plugin'];
+			} elseif ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
+				$hit = in_array( $ours, $hook_extra['plugins'], true );
+			}
+
+			// Another plugin was updated: leave our cached release and backoff
+			// alone, otherwise every unrelated update costs a GitHub request.
+			if ( ! $hit ) {
 				return;
 			}
 		}
+
 		$this->flush();
 	}
 
