@@ -79,17 +79,27 @@ final class XSMG_GitHub_Updater {
 
 		$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
 		$path = (string) wp_parse_url( $url, PHP_URL_PATH );
+		$repo = '/' . strtolower( 'Gnoztis/news-sitemap-generator' );
 
 		if ( 'github.com' === $host ) {
 			// A release asset is downloaded from github.com/<owner>/<repo>/
 			// releases/download/...; authorise it only for our own repository, so
 			// the token cannot travel to another plugin's download.
-			$ours = '/' . strtolower( 'news-sitemap-generator' ) . '/';
-
-			if ( false === strpos( strtolower( $path ), '/releases/download/' ) || false === strpos( strtolower( $path ), $ours ) ) {
+			if ( false === strpos( strtolower( $path ), '/releases/download/' ) || false === strpos( strtolower( $path ), '/' . strtolower( 'news-sitemap-generator' ) . '/' ) ) {
 				return $args;
 			}
-		} elseif ( ! in_array( $host, [ 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com' ], true ) ) {
+		} elseif ( 'api.github.com' === $host ) {
+			// API calls carry the repository in the path: /repos/<owner>/<repo>/...
+			if ( false === strpos( strtolower( $path ), $repo . '/' ) ) {
+				return $args;
+			}
+		} elseif ( 'codeload.github.com' === $host ) {
+			// codeload paths start with the repository: /<owner>/<repo>/zipball/...
+			if ( 0 !== strpos( strtolower( $path ), $repo . '/' ) ) {
+				return $args;
+			}
+		} elseif ( 'objects.githubusercontent.com' !== $host ) {
+			// The signed asset host cannot expose the repository in the path.
 			return $args;
 		}
 
